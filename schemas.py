@@ -1,7 +1,7 @@
 # app/schemas.py
 from pydantic import BaseModel,Field,EmailStr
 from datetime import datetime,date
-from typing import Optional
+from typing import Optional,List
 from pydantic import BaseModel, EmailStr,validator
 from enum import Enum
 from datetime import date
@@ -45,12 +45,23 @@ class UserCreate(BaseModel):
     first_name :str
     last_name:str
     role: Optional[str] = None
-    
+    security_answer: str  
+
+class UserInDB(BaseModel):
+    email: str
+    username: str
+    first_name: str
+    last_name: str
+    role: str
+    password_hash: str
+    security_answer_hash: str  # Hashed version stored in DB
 
 class UserResponse(BaseModel):
     id: int
     username: str
     email:EmailStr
+    security_question: str
+    security_answer: str  
     model_config = {
         "from_attributes": True  
     }
@@ -135,9 +146,12 @@ class PredictionCreate(BaseModel):
 # Response model (includes ID and timestamp)
 class PredictionResponse(BaseModel):
     prediction_id: int
+    patient_id: int
     prediction_label:str
     risk_level:str
+    model_used: str
     confidence_score:float 
+    created_at:datetime
 
     
 
@@ -145,9 +159,16 @@ class UserLogin(BaseModel):
     email: EmailStr
     password: str
 
-class ForgotPasswordRequest(BaseModel):
-    email: EmailStr
+
+class EmailSchema(BaseModel):
+   email: List[EmailStr]
 
 class ResetPasswordRequest(BaseModel):
-    token: str
+    email: EmailStr
+    security_answer: str 
+    new_password: str 
+
+class VerifySecurityAnswerRequest(BaseModel):
+    email: EmailStr
+    security_answer: str
     new_password: str

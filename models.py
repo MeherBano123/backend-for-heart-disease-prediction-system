@@ -35,6 +35,8 @@ class User(SQLModel, table=True):
     )
     last_login: Optional[datetime] = None
     is_active: bool = Field(default=True)
+    security_question: Optional[str] = Field(max_length=255)
+    security_answer_hash:str = Field(max_length=256)
 
     @validator('created_at', 'last_login', pre=True)
     def parse_datetime(cls, value):
