@@ -15,12 +15,16 @@ from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
 from typing import Optional, List
 from datetime import datetime , date,timedelta
 from sqlalchemy.sql import func
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
+from fastapi import Request
 import traceback
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from sqlalchemy import ForeignKey
 from jose import JWTError, jwt
 from models import *
 from schemas import *
+from .env import SECRET_KEY,ALGORITHM,ACCESS_TOKEN_EXPIRE_MINUTES
 import bcrypt
 import smtplib
 from email.mime.text import MIMEText
@@ -95,10 +99,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-# Security configurations
-SECRET_KEY = "926138007fe6ff3b7e6e296b43dc50c9ba15d9308b541e7d5af142bf9242ee23"  
-ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 45
+
 
 
 # OAuth2 scheme
@@ -453,9 +454,6 @@ async def login_for_access_token(form_data: UserLogin, session: Session = Depend
         
     }
 
-from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
-from fastapi import Request
 
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
