@@ -67,6 +67,7 @@ class UserResponse(BaseModel):
     }
 
 
+
 ## patient request and response model
 class PatientCreate(BaseModel):
     full_name: str
@@ -159,16 +160,50 @@ class UserLogin(BaseModel):
     email: EmailStr
     password: str
 
-
+class LogoutResponse(BaseModel):
+    success: bool
+    message: str
 class EmailSchema(BaseModel):
    email: List[EmailStr]
 
 class ResetPasswordRequest(BaseModel):
     email: EmailStr
     security_answer: str 
-    new_password: str 
+    new_password: str
+    @validator('security_answer')
+    def normalize_answer(cls, v):
+        if not v or not v.strip():
+            raise ValueError("Security answer cannot be empty")
+        return v.lower().strip()
+    @validator('new_password')
+    def validate_password(cls, v):
+        if len(v) < 8:
+            raise ValueError("Password must be at least 8 characters")
+        if not any(c.isupper() for c in v):
+            raise ValueError("Password must contain at least one uppercase letter")
+        if not any(c.isdigit() for c in v):
+            raise ValueError("Password must contain at least one digit")
+        return v 
 
 class VerifySecurityAnswerRequest(BaseModel):
     email: EmailStr
     security_answer: str
     new_password: str
+
+
+class ForgotPasswordRequest(BaseModel):
+    email: EmailStr
+    security_answer: str
+    new_password: str
+
+class ForgotPasswordResponse(BaseModel):
+    success: bool
+    message: str
+
+class PatientPredictionResponse(BaseModel):
+    patient_id: int
+    prediction_id: int 
+    prediction_label: str
+    risk_level: str
+    model_used: str
+    confidence_score: float    

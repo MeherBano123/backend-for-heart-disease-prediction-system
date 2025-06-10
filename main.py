@@ -5,15 +5,19 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.responses import HTMLResponse,FileResponse
 from sqlmodel import SQLModel, Field, Session, create_engine , select
 from typing import Optional
+from sqlmodel import and_
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import aliased
 from sqlalchemy import desc
 from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks
 from pydantic import BaseModel, EmailStr
 import asyncio
+import logging
 from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
 from typing import Optional, List
 from datetime import datetime , date,timedelta
+from sqlmodel import update
 from sqlalchemy.sql import func
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
@@ -24,7 +28,7 @@ from sqlalchemy import ForeignKey
 from jose import JWTError, jwt
 from models import *
 from schemas import *
-from .env import SECRET_KEY,ALGORITHM,ACCESS_TOKEN_EXPIRE_MINUTES
+# from .env import SECRET_KEY,ALGORITHM,ACCESS_TOKEN_EXPIRE_MINUTES
 import bcrypt
 import smtplib
 from email.mime.text import MIMEText
@@ -91,6 +95,7 @@ def load_model():
             raise TypeError("Loaded object is not a trained model.")
         model = model_obj
     print("✅ ML model loaded successfully.")
+    
 # Configure CORS
 app.add_middleware(
     CORSMiddleware,
@@ -100,7 +105,32 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+@app.middleware("http")
+async def cleanup_expired_tokens(request: Request, call_next):
+    try:
+        # Run cleanup before processing the request
+        with Session(engine) as session:
+            expired = session.exec(
+                select(TokenBlacklist)
+                .where(TokenBlacklist.expires_at < datetime.utcnow())
+            ).all()
+            
+            for token in expired:
+                session.delete(token)
+            
+            session.commit()
+    except Exception as e:
+        print(f"Token cleanup error: {str(e)}")
+    
+    response = await call_next(request)
+    return response
 
+
+
+# Security configurations
+SECRET_KEY = "926138007fe6ff3b7e6e296b43dc50c9ba15d9308b541e7d5af142bf9242ee23"  
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 45
 
 # OAuth2 scheme
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
@@ -236,7 +266,15 @@ def get_current_user(token: str = Depends(oauth2_scheme), session: Session = Dep
     except JWTError:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
 
-
+def get_token_expiry(token: str) -> datetime:
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        return datetime.utcfromtimestamp(payload["exp"])
+    except JWTError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid token"
+        ) 
 class UserInDB(User):
     hashed_password: str
 
@@ -251,24 +289,36 @@ def get_db():
         yield session    
  # function to get current user 
 
-async def get_current_user(token: str = Depends(oauth2_scheme)):
-    credential_exception = HTTPException(status_code=status.HTTP_401_UNAUTHORIZED,
-                                         detail="Could not validate credentials", headers={"WWW-Authenticate": "Bearer"})
+def get_current_user(token: str = Depends(oauth2_scheme), session: Session = Depends(get_session)) -> User:
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    
     try:
+        # Check token blacklist first
+        blacklisted = session.exec(
+            select(TokenBlacklist).where(TokenBlacklist.token == token)
+        ).first()
+        
+        if blacklisted:
+            raise credentials_exception
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
         username: str = payload.get("sub")
         if username is None:
-            raise credential_exception
-
-        token_data = TokenData(username=username)
+            raise credentials_exception
+            
+        user = session.exec(select(User).where(User.email == username)).first()
+        if user is None:
+            raise credentials_exception
+            
+        return user
+        
     except JWTError:
-        raise credential_exception
+        raise credentials_exception
+    
 
-    user = get_user(get_db(), username=token_data.username)
-    if user is None:
-        raise credential_exception
-
-    return user
 
 @app.get("/")
 def read_root():
@@ -308,7 +358,7 @@ def create_user( user_data: UserCreate, session: Session = Depends(get_session))
             password_hash= password_hash, 
             first_name = user_data.first_name.title(),
             last_name = user_data.last_name.title(),
-            role=user_data.role,
+            role=user_data.role.title(),
             security_question='What is your Birth City ?',
             security_answer_hash=security_answer_case,
             created_at=datetime.utcnow(),  # Set server-side
@@ -462,29 +512,100 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
         content={"detail": exc.errors(), "body": exc.body},
     )
 
-@app.post("/api/reset-password")
-async def reset_password(request: ResetPasswordRequest, db: Session = Depends(get_db)):
-    print("Received request:", request.dict())
-
-    # Retrieve the user by email and plain-text security answer
-    user = db.query(User).filter(
-        User.email == request.email,
-        User.security_answer_hash == request.security_answer
+@app.post("/logout", response_model=LogoutResponse)
+async def logout(
+    current_user: User = Depends(get_current_user),
+    token: str = Depends(oauth2_scheme),
+    session: Session = Depends(get_session)
+):
+    """
+    Logout endpoint that invalidates the current JWT token.
+    
+    - Blacklists the current token
+    - Updates user's last login time
+    - Returns success message
+     """
+    
+    # Check if token is already blacklisted
+    existing = session.exec(
+        select(TokenBlacklist).where(TokenBlacklist.token == token)
     ).first()
-
-    if not user:
+    
+    if existing:
         raise HTTPException(
-            status_code=401,
-            detail="Invalid email or security answer"
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Token already invalidated"
         )
+    
+    try:
+        # Create blacklist entry
+        blacklisted_token = TokenBlacklist(
+            token=token,
+            expires_at=get_token_expiry(token),
+            user_id=current_user.id
+        )
+        
+        session.add(blacklisted_token)
+        
+        # Update user's last login (optional)
+        current_user.last_login = datetime.utcnow()
+        session.add(current_user)
+        
+        session.commit()
+        
+        return {
+            "success": True,
+            "message": "Successfully logged out"
+        }
+        
+    except Exception as e:
+        session.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Logout failed: {str(e)}"
+        )
+    
 
-    # Hash and update the new password
-    user.hashed_password = pwd_context.hash(request.new_password)
-    db.commit()
-
-    return {"message": "Password reset successful"}
 
 
+
+
+@app.post("/api/reset-password")
+async def forgot_password(request: ForgotPasswordRequest):
+    with Session(engine) as session:
+        try:
+            # Directly update password where credentials match
+            stmt = (
+                update(User)
+                .where(
+                    and_(
+                        User.email == request.email,
+                        User.security_answer_hash == request.security_answer.lower()
+                    )
+                )
+                .values(password_hash=pwd_context.hash(request.new_password))
+            )
+            
+            result = session.exec(stmt)
+            session.commit()
+
+            if result.rowcount == 0:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="Invalid email or security answer",
+                )
+
+            return {
+                "success": True,
+                "message": "Password updated successfully"
+            }
+
+        except Exception as e:
+            session.rollback()
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=str(e)
+            )
 # api to create patient
 @app.post("/patients/create", response_model=PatientResponse)
 def create_patient(
@@ -493,6 +614,10 @@ def create_patient(
     # current_user: User = Depends(get_current_user)
 ):
     try:
+      
+        patient_dict = patient_data.dict()
+        patient_dict['full_name'] = patient_dict['full_name'].strip().title()
+
         new_patient = Patient(
             **patient_data.dict(),
             created_at=datetime.utcnow(),
@@ -603,7 +728,24 @@ def delete_patient(
     db.commit()
     return None
 
+# get patient by patient id api
+@app.get("/patient/retrieve/id/{patient_id}", response_model=PatientResponse)
+def get_patient_by_id(
+    patient_id: int, 
+    db: Session = Depends(get_db),
+    
+):
+    """Get a specific patient by patient ID"""
+    patient = db.get(Patient, patient_id)
+    
+    if not patient:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Patient with ID {patient_id} not found"
+        )
+    
 
+    return patient
 
 
 @app.post("/predict/{patient_id}", response_model=Prediction)
@@ -611,7 +753,7 @@ def create_prediction(patient_id: int, session: Session = Depends(get_session)):
     try:
         # 1. Get patient - SQLModel compatible query
         statement = select(Patient).where(Patient.patient_id == patient_id)
-        patient = session.exec(statement).scalar_one_or_none()
+        patient = session.execute(statement).scalar()
         
         if not patient:
             raise HTTPException(status_code=404, detail="Patient not found")
@@ -664,25 +806,47 @@ def create_prediction(patient_id: int, session: Session = Depends(get_session)):
         traceback.print_exc()  # Logs full stack trace
         raise HTTPException(status_code=500, detail=str(e))
     
-# api to get latest prediction of a specific user 
-@app.get("/predictions/patient/{patient_id}", response_model=Prediction)
-def get_predictions_by_patient(patient_id: int, session: Session = Depends(get_session)):
-    prediction = session.exec(
-        select(Prediction)
-        .where(Prediction.patient_id == patient_id)
-        .order_by(desc(Prediction.created_at))
-        .limit(1)
-    ).first()
-    
-    if not prediction:
-        raise HTTPException(status_code=404, detail="No predictions found for this patient")
-    
-    return prediction
 
+
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+from sqlmodel import select, desc
+from fastapi import HTTPException, Depends
+
+
+@app.get("/predictions/patient/{patient_id}", response_model=PatientPredictionResponse)
+def get_latest_prediction_by_patient(patient_id: int, session: Session = Depends(get_session)):
+    try:
+        # First check if patient exists
+        patient = session.get(Patient, patient_id)
+        if not patient:
+            raise HTTPException(status_code=404, detail=f"Patient with ID {patient_id} not found")
+
+        # Get latest prediction
+        prediction = session.exec(
+            select(Prediction)
+            .where(Prediction.patient_id == patient_id)
+            .order_by(desc(Prediction.created_at))
+        ).first()
+        
+        if not prediction:
+            raise HTTPException(status_code=404, detail=f"No predictions found for patient {patient_id}")
+            
+        return prediction
+        
+    except SQLAlchemyError as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Database error: {str(e)}"
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Unexpected error: {str(e)}"
+        )
 ## api to return prediction report
-
-
-
 
 @app.get("/prediction/report/{prediction_id}")
 def get_prediction_report(prediction_id: int, db: Session = Depends(get_db)):

@@ -9,8 +9,11 @@ from typing import Optional
 from passlib.context import CryptContext
 from typing import Optional
 from sqlmodel import SQLModel, Field, Session
-from pydantic import validator
-
+from pydantic import validator 
+from sqlmodel import SQLModel, Field, Relationship
+from typing import Optional
+from datetime import date, datetime
+from sqlalchemy.sql import func
 
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
@@ -52,13 +55,20 @@ class User(SQLModel, table=True):
     def verify_password(self, plain_password: str):
         return pwd_context.verify(plain_password, self.hashed_password)
     
+class TokenBlacklist(SQLModel, table=True):
+    __tablename__ = "token_blacklist"
+    
+    id: Optional[int] = Field(default=None, primary_key=True)
+    token: str = Field(index=True, unique=True)
+    expires_at: datetime
+    user_id: int = Field(foreign_key="users.id")
+    created_at: datetime = Field(
+        default_factory=datetime.utcnow,
+        sa_column_kwargs={"server_default": func.now()}
+    )
 
 
-# Updated Patient Model 
-from sqlmodel import SQLModel, Field, Relationship
-from typing import Optional
-from datetime import date, datetime
-from sqlalchemy.sql import func
+
 
 class Patient(SQLModel, table=True):
     __tablename__ = "patients"
